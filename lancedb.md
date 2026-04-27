@@ -162,7 +162,11 @@ message PageLayout {
 }
 ```
 
-### Repetition and Definition Levels
+**Lance 编码策略 = 结构编码（4 种布局自动选择）+ 压缩（多种算法按需组合）。**
+
+### 结构化编码
+
+#### Repetition and Definition Levels
 
 Arrow作为一套内存数据结构标准，其数据存储在一个或多个连续的内存块中，通过**Validity Bitmap（NULL 标记位图）**、**Offsets Buffer（偏移数组）**和**Data Buffer（值缓冲区）**三部分来表示不同的数据类型。
 
@@ -201,7 +205,7 @@ Arrow作为一套内存数据结构标准，其数据存储在一个或多个连
 
 这在**磁盘存储**和**网络传输**场景下能显著提升性能。
 
-#### Definition Levels
+##### Definition Levels
 
 ```text
 [{"middle": {"inner": 1]}}, NULL, {"middle": NULL}, {"middle": {"inner": NULL}}]
@@ -227,7 +231,7 @@ Values         : 1, ?, ?, ?  # 对应值，不存在标？，NULL标0
 
 核心：**当前值定义到哪一层**
 
-#### Repetition Levels
+##### Repetition Levels
 
 ```text
 [{<0,1>, <>, <2>}, {<3>}, {}], [], [{<4>}]
@@ -257,7 +261,7 @@ Values         : [0, 1, 2, 3, 4]  # 最终值
 
 核心：**当前值所在的列表，与上一个值共享到哪一层**
 
-#### 结合D&R Levels例子还原数据结构
+##### 结合D&R Levels例子还原数据结构
 
 原数据结构
 
@@ -296,7 +300,7 @@ Def:    [0, 0, 1, 0, 0, 2, 3, 2]
 
  (Rep, Def) 对就定义了一个完整结构，有值的对一定是def为0，即最内层
 
-### Mini Block
+#### Mini Block Page Layout
 
 专门用于**小数据类型**（如整数、浮点、短字符串、布尔值等）的一种**自适应结构编码策略**。
 
@@ -389,9 +393,274 @@ Page 级别的 Buffer（3~4 个）
 └─────────────────────────────────────────────────────────────┘
 ```
 
+> Buffer 0：Mini Block 元数据
 
+| 属性         | 说明                                            |
+| ------------ | ----------------------------------------------- |
+| **作用**     | 支持**随机访问**的快速查找表                    |
+| **内容**     | 每个 Mini Block 2 字节的元数据                  |
+| **格式**     | 低 4 bits = `log₂(值数量)`，高 12 bits = 字节数 |
+| **加载时机** | **初始化阶段**必须加载到 Search Cache           |
+| **内存占用** | 极少（10亿行约 1.28 GiB）                       |
 
+```text
+每个块 2 字节示例：
+┌─────────────────────────────────────┐
+│  0x0A      │      0x0247            │
+│  低4bits   │      高12bits           │
+│  log₂(1024)=10 │   679 words=5432 bytes │
+└─────────────────────────────────────┘
+```
 
+**为什么需要它？** 随机访问时，先查 Buffer 0 定位到具体的 Mini Block，然后只读那个块。
+
+> Buffer 1：Mini Blocks 数据（实际数据）
+
+| 属性           | 说明                                                         |
+| -------------- | ------------------------------------------------------------ |
+| **作用**       | 存储**所有压缩后的 Mini Block**                              |
+| **内容**       | 多个 Mini Block 顺序排列                                     |
+| **每个块内部** | `block header` + `rep levels` + `def levels` + `buffer 1...n` + `padding` |
+| **块大小**     | 压缩后 4~32KB（通常接近 4KB）                                |
+| **值数量**     | 128~8192 个值（2 的幂，最后一个块例外）                      |
+
+```text
+Buffer 1 的物理布局：
+┌─────────────┬─────────────┬─────────────┐
+│  MiniBlock  │  MiniBlock  │  MiniBlock  │
+│     #0      │     #1      │     #N      │
+│  (4~8KB)    │  (4~8KB)    │  (剩余)      │
+└─────────────┴─────────────┴─────────────┘
+```
+
+逻辑上的主数据，物理上实际是buffer1
+
+> Buffer 2：字典或重复索引（可选）
+
+Buffer 2 是**复用**的，根据数据特征二选一：
+
+情况 A：Dictionary Encoding（字典编码）
+
+| 属性         | 说明                                      |
+| ------------ | ----------------------------------------- |
+| **内容**     | 字典值（唯一值的集合）                    |
+| **加载时机** | 初始化时**全部加载并解码**到 Search Cache |
+| **压缩**     | 通过 block-compression 路径单独配置       |
+| **适用**     | 低基数列（如状态码、类别）                |
+
+```text
+有字典时的页面布局：
+Buffer 0: 元数据
+Buffer 1: Mini Blocks（存的是字典索引，不是原始值）
+Buffer 2: 字典值
+```
+
+情况 B：Repetition Index（重复索引）
+
+| 属性         | 说明                                                    |
+| ------------ | ------------------------------------------------------- |
+| **内容**     | u64 数组，N × D 个值（N=块数，D=随机访问深度+1）        |
+| **作用**     | 将**行偏移**翻译为**item 偏移**（支持 List 的随机访问） |
+| **当前限制** | 仅支持 **1 维随机访问**                                 |
+| **压缩**     | **目前不压缩**                                          |
+
+```text
+无字典、有 List 时的页面布局：
+Buffer 0: 元数据
+Buffer 1: Mini Blocks
+Buffer 2: Repetition Index
+```
+
+> 情况 C：两者都有
+
+| 属性         | 说明             |
+| ------------ | ---------------- |
+| **Buffer 2** | 字典             |
+| **Buffer 3** | Repetition Index |
+
+> 读取流程示例
+
+全表扫描（Full Scan）
+
+```text
+1. 顺序读取 Buffer 1 的所有 Mini Blocks
+2. 逐个解码（rep → def → values）
+3. 无需 Buffer 0 和 Buffer 2
+```
+
+随机点查（Random Access）
+
+```text
+1. 从 Buffer 0 查目标行属于哪个 Mini Block
+   （通过累加各块值数量定位）
+2. 读取对应的 Mini Block（Buffer 1 中的某个范围）
+3. 如果有 List，用 Buffer 2 的 Repetition Index 翻译偏移
+4. 解码该块，找到目标值
+```
+
+#### Full Zip Page Layout
+
+> 使用场景
+
+- 大数据类型（≥128 字节/值，如向量嵌入）
+- 避免 Mini Block 的"每 16 个值一个描述符"的元数据开销
+
+> 核心特点
+
+| 特性             | 说明                                                         |
+| ---------------- | ------------------------------------------------------------ |
+| **透明压缩**     | 压缩后必须返回固定宽度或可变宽度的 flat layout，以便索引单个值 |
+| **Zip 存储**     | repetition、definition、value 数据**交错 zip 到单个 buffer** |
+| **Control Word** | 每个值开头有控制字，包含 rep/def 信息和值大小                |
+
+> Data Buffer（buffer0）
+
+![Full Zip Layout](lancedb.assets/fullzip.png)
+
+| Bytes | Meaning        |
+| :---- | :------------- |
+| 0-4   | Control word 0 |
+| 0/4/8 | Value 0 size   |
+| *     | Value 0 data   |
+| ...   | ...            |
+| 0-4   | Control word N |
+| 0/4/8 | Value N size   |
+| *     | Value N data   |
+
+> Repetition Index (Buffer 1)
+
+![Full Zip Layout](lancedb.assets/fullzip_rep.png)
+
+> 读取流程示例
+
+- 随机访问需要 **2 次 I/O**：先读 repetition index 定位，再读 data buffer
+- 也可将整个 repetition index 加载到内存缓存中
+
+> protobuf
+
+```text
+message FullZipLayout {
+  // The number of bits of repetition info (0 if there is no repetition)
+  uint32 bits_rep = 1;
+  // The number of bits of definition info (0 if there is no definition)
+  uint32 bits_def = 2;
+  // The number of bits of value info
+  //
+  // Note: we use bits here (and not bytes) for consistency with other encodings.  However, in practice,
+  // there is never a reason to use a bits per value that is not a multiple of 8.  The complexity is not
+  // worth the small savings in space since this encoding is typically used with large values already.
+  oneof details {
+    // If this is a fixed width block then we need to have a fixed number of bits per value
+    uint32 bits_per_value = 3;
+    // If this is a variable width block then we need to have a fixed number of bits per offset
+    uint32 bits_per_offset = 4;
+  }
+  // The number of items in the page
+  uint32 num_items = 5;
+  // The number of visible items in the page
+  uint32 num_visible_items = 6;
+  // Description of the compression of values
+  CompressiveEncoding value_compression = 7;
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  repeated RepDefLayer layers = 8;
+
+}
+```
+
+描述数据缓存区压缩、控制字大小、每个值有多少位
+
+#### Constant Page Layout
+
+- **适用**：所有可见值都是相同的标量值，或全为 NULL
+- **存储**：只需 rep/def levels + 内联标量值（≤32 字节）
+- 即使全 NULL，如果有 Struct/List 层级，仍需存储 rep/def levels 以区分"空结构" vs "空列表" vs "NULL 值"
+
+> protobuf
+
+```text
+message ConstantLayout {
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  repeated RepDefLayer layers = 5;
+
+  // Inline fixed-width scalar value bytes.
+  //
+  // This MUST only be used for types where a single non-null element is represented by a single
+  // fixed-width Arrow value buffer (i.e. no offsets buffer, no child data).
+  //
+  // Constraints:
+  // - MUST be absent for an all-null page
+  // - MUST be <= 32 bytes if present
+  optional bytes inline_value = 6;
+
+  // Optional compression algorithm used for the repetition buffer.
+  // If absent, repetition levels are stored as raw u16 values.
+  CompressiveEncoding rep_compression = 7;
+  // Optional compression algorithm used for the definition buffer.
+  // If absent, definition levels are stored as raw u16 values.
+  CompressiveEncoding def_compression = 8;
+  // Number of values in repetition buffer after decompression.
+  uint64 num_rep_values = 9;
+  // Number of values in definition buffer after decompression.
+  uint64 num_def_values = 10;
+
+}
+```
+
+只需要知道R&D Levels和（如果存在）内联标量值字节即可。
+
+#### Blob Page Layout
+
+- **适用**：超大二进制数据（如 1MB+ 的图片、视频）
+- **设计**：数据存储在外部 buffer，页面只存**描述符**（position + size）
+- **NULL 编码**：position 和 size 都为 0 → 空值；size=0 且 position≠0 → NULL（position 存 definition level）
+- **I/O 模型**：每个值一次 I/O，适合 justify 单 IOPS 的场景
+
+> protobuf
+
+```text
+message BlobLayout {
+  // The inner layout used to store the descriptions
+  PageLayout inner_layout = 1;
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  //
+  // The inner layout's repdef layers will always be 1 all valid item layer
+  repeated RepDefLayer layers = 2;
+
+}
+```
+
+### 半结构化数据转换
+
+在进行结构化编码前要对数据进行转转换，具体转换手段如下：
+
+| 转换                    | 说明                                                         |
+| ----------------------- | ------------------------------------------------------------ |
+| **Dictionary Encoding** | 字典编码，适用于低基数列，在结构编码前应用                   |
+| **Struct Packing**      | 将 Struct 从列式转为行式存储，减少随机访问 I/O，但不能再单独读字段 |
+| **Fixed Size List**     | 扁平化固定大小列表，压缩库无需关心 list 结构                 |
+
+### 数据压缩
+
+| 技术                   | 适用场景       | 特点                                                 |
+| ---------------------- | -------------- | ---------------------------------------------------- |
+| **Flat**               | 固定宽度数据   | 无压缩，找最大 2 的幂值数使块 < 8KB                  |
+| **Variable**           | 可变宽度数据   | 无压缩，walk 值直到接近 4KB                          |
+| **Bitpacking**         | 整数数据       | 去除未使用的高位，每块 1024 值                       |
+| **RLE**                | 重复值多的数据 | 游程编码，阈值默认 0.5（run\_count / num\_values）   |
+| **FSST**               | 字符串数据     | 快速静态符号表压缩                                   |
+| **BSS**                | 浮点数据       | 字节流拆分，配合通用压缩使用                         |
+| **General (LZ4/Zstd)** | 所有数据       | 通用压缩，Mini Block 中压整个块，Full Zip 中压每个值 |
+
+### Lance配置参数
+
+| 配置项                             | 说明                                |
+| ---------------------------------- | ----------------------------------- |
+| `lance-encoding:compression`       | `lz4` / `zstd` / `none` / `fsst`    |
+| `lance-encoding:compression-level` | 压缩级别（Zstd: 0-22）              |
+| `lance-encoding:rle-threshold`     | RLE 阈值（默认 0.5）                |
+| `lance-encoding:bss`               | `off` / `on` / `auto`               |
+| `lance-encoding:dict-divisor`      | 字典编码触发阈值                    |
+| `LANCE_MINIBLOCK_MAX_VALUES`       | mini-block每块最大值数（默认 4096） |
 
 ## Lance Table Format
 
