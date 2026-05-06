@@ -666,6 +666,618 @@ message BlobLayout {
 
 The Lance table format organizes datasets as **versioned collections of fragments and indices**. Each version is described by an **immutable manifest file** that references **data files, deletion files, transaction file and indices**. The format supports **ACID transactions, schema evolution, and efficient incremental updates through Multi-Version Concurrency Control (MVCC).**
 
+![Overview](lancedb.assets/table_overview.png)
+
+**Fragment**
+
+一个片段（fragment）表示数据集的水平分区，包含一组行数据。每个片段都有一个唯一的uint32标识符，该标识符根据数据集的最大片段ID递增分配。每个fragment包含一个或多个数据列存储文件，即.lance文件（每个文件都可以单独压缩/编码），另外还可能包含至多一个可选的删除文件。
+
+![Fragment Structure](lancedb.assets/fragment_structure.png)
+
+DataFragment序列化信息
+
+```rust
+message DataFragment {
+  // The ID of a DataFragment is unique within a dataset.
+  uint64 id = 1;
+
+  repeated DataFile files = 2;
+
+  // File that indicates which rows, if any, should be considered deleted.
+  DeletionFile deletion_file = 3;
+
+  // TODO: What's the simplest way we can allow an inline tombstone bitmap?
+
+  // A serialized RowIdSequence message (see rowids.proto).
+  //
+  // These are the row ids for the fragment, in order of the rows as they appear.
+  // That is, if a fragment has 3 rows, and the row ids are [1, 42, 3], then the
+  // first row is row 1, the second row is row 42, and the third row is row 3.
+  oneof row_id_sequence {
+    // If small (< 200KB), the row ids are stored inline.
+    bytes inline_row_ids = 5;
+    // Otherwise, stored as part of a file.
+    ExternalFile external_row_ids = 6;
+  } // row_id_sequence
+
+  oneof last_updated_at_version_sequence {
+    // If small (< 200KB), the row latest updated versions are stored inline.
+    bytes inline_last_updated_at_versions = 7;
+    // Otherwise, stored as part of a file.
+    ExternalFile external_last_updated_at_versions = 8;
+  } // last_updated_at_version_sequence
+
+  oneof created_at_version_sequence {
+    // If small (< 200KB), the row created at versions are stored inline.
+    bytes inline_created_at_versions = 9;
+    // Otherwise, stored as part of a file.
+    ExternalFile external_created_at_versions = 10;
+  } // created_at_version_sequence
+
+  // Number of original rows in the fragment, this includes rows that are now marked with
+  // deletion tombstones. To compute the current number of rows, subtract
+  // `deletion_file.num_deleted_rows` from this value.
+  uint64 physical_rows = 4;
+
+}
+```
+
+- data files: 用于存储一个fragment中列的子集
+
+  ```rust
+  message DataFile {
+    // Path to the root relative to the dataset's URI.
+    string path = 1;
+    // The ids of the fields/columns in this file.
+    //
+    // When a DataFile object is created in memory, every value in fields is assigned -1 by
+    // default. An object with a value in fields of -1 must not be stored to disk. -2 is
+    // used for "tombstoned", meaning a field that is no longer in use. This is often
+    // because the original field id was reassigned to a different data file.
+    //
+    // In Lance v1 IDs are assigned based on position in the file, offset by the max
+    // existing field id in the table (if any already). So when a fragment is first created
+    // with one file of N columns, the field ids will be 1, 2, ..., N. If a second fragment
+    // is created with M columns, the field ids will be N+1, N+2, ..., N+M.
+    //
+    // In Lance v1 there is one field for each field in the input schema, this includes
+    // nested fields (both struct and list).  Fixed size list fields have only a single
+    // field id (these are not considered nested fields in Lance v1).
+    //
+    // This allows column indices to be calculated from field IDs and the input schema.
+    //
+    // In Lance v2 the field IDs generally follow the same pattern but there is no
+    // way to calculate the column index from the field ID.  This is because a given
+    // field could be encoded in many different ways, some of which occupy a different
+    // number of columns.  For example, a struct field could be encoded into N + 1 columns
+    // or it could be encoded into a single packed column.  To determine column indices
+    // the column_indices property should be used instead.
+    //
+    // In Lance v1 these ids must be sorted but might not always be contiguous.
+    repeated int32 fields = 2;
+    // The top-level column indices for each field in the file.
+    //
+    // If the data file is version 1 then this property will be empty
+    //
+    // Otherwise there must be one entry for each field in `fields`.
+    //
+    // Some fields may not correspond to a top-level column in the file.  In these cases
+    // the index will -1.
+    //
+    // For example, consider the schema:
+    //
+    // - dimension: packed-struct (0):
+    //   - x: u32 (1)
+    //   - y: u32 (2)
+    // - path: `list<u32>` (3)
+    // - embedding: `fsl<768>` (4)
+    //   - fp64
+    // - borders: `fsl<4>` (5)
+    //   - simple-struct (6)
+    //     - margin: fp64 (7)
+    //     - padding: fp64 (8)
+    //
+    // One possible column indices array could be:
+    // [0, -1, -1, 1, 3, 4, 5, 6, 7]
+    //
+    // This reflects quite a few phenomenon:
+    // - The packed struct is encoded into a single column and there is no top-level column
+    //   for the x or y fields
+    // - The variable sized list is encoded into two columns
+    // - The embedding is encoded into a single column (common for FSL of primitive) and there
+    //   is not "FSL column"
+    // - The borders field actually does have an "FSL column"
+    //
+    // The column indices table may not have duplicates (other than -1)
+    repeated int32 column_indices = 3;
+    // The major file version used to create the file
+    uint32 file_major_version = 4;
+    // The minor file version used to create the file
+    //
+    // If both `file_major_version` and `file_minor_version` are set to 0,
+    // then this is a version 0.1 or version 0.2 file.
+    uint32 file_minor_version = 5;
+  
+    // The known size of the file on disk in bytes.
+    //
+    // This is used to quickly find the footer of the file.
+    //
+    // When this is zero, it should be interpreted as "unknown".
+    uint64 file_size_bytes = 6;
+  
+    // The base path index of the data file. Used when the file is imported or referred from another dataset.
+    // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
+    optional uint32 base_id = 7;
+  
+  }
+  ```
+
+- delete file: 一个fragment中至多有一个删除文件，该删除文件用于跟踪已删除的行，而无需重写数据文件。其中包含两种存储格式：Arrow IPC格式（扩展名为.arrow）存储一个Int32Array，其中包含被删除行的偏移量，适用于稀疏删除场景；Roaring Bitmap格式（扩展名为.bin）存储一个压缩的Roaring Bitmap，适用于密集删除场景。实际在读取数据的时候需要过滤掉该删除文件中出现的偏移量所对应的行。
+
+  ```rust
+  message DeletionFile {
+    // Type of deletion file, intended as a way to increase efficiency of the storage of deleted row
+    // offsets. If there are sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there
+    // are densely deleted rows, then BITMAP is the most efficient.
+    enum DeletionFileType {
+      // A single Int32Array of deleted row offsets, stored as an Arrow IPC file with one batch and
+      // one column. Has a .arrow extension.
+      ARROW_ARRAY = 0;
+      // A Roaring Bitmap of deleted row offsets. Has a .bin extension.
+      BITMAP = 1;
+    }
+  
+    // Type of deletion file.
+    DeletionFileType file_type = 1;
+    // The version of the dataset this deletion file was built from.
+    uint64 read_version = 2;
+    // An opaque id used to differentiate this file from others written by concurrent
+    // writers.
+    uint64 id = 3;
+    // The number of rows that are marked as deleted.
+    uint64 num_deleted_rows = 4;
+    // The base path index of the deletion file. Used when the file is imported or referred from another
+    // dataset. Lance uses it as key of the base_paths field in Manifest to determine the actual base
+    // path of the deletion file.
+    optional uint32 base_id = 7;
+  
+  }
+  ```
+
+### schema
+
+schema序列化信息
+
+```rust
+message Field {
+  enum Type {
+    PARENT = 0;
+    REPEATED = 1;
+    LEAF = 2;
+  }
+  Type type = 1;
+
+  // Fully qualified name.
+  string name = 2;
+  /// Field Id.
+  ///
+  /// See the comment in `DataFile.fields` for how field ids are assigned.
+  int32 id = 3;
+  /// Parent Field ID. If not set, this is a top-level column.
+  int32 parent_id = 4;
+
+  // Logical types, support parameterized Arrow Type.
+  //
+  // PARENT types will always have logical type "struct".
+  //
+  // REPEATED types may have logical types:
+  // * "list"
+  // * "large_list"
+  // * "list.struct"
+  // * "large_list.struct"
+  // The final two are used if the list values are structs, and therefore the
+  // field is both implicitly REPEATED and PARENT.
+  //
+  // LEAF types may have logical types:
+  // * "null"
+  // * "bool"
+  // * "int8" / "uint8"
+  // * "int16" / "uint16"
+  // * "int32" / "uint32"
+  // * "int64" / "uint64"
+  // * "halffloat" / "float" / "double"
+  // * "string" / "large_string"
+  // * "binary" / "large_binary"
+  // * "date32:day"
+  // * "date64:ms"
+  // * "decimal:128:{precision}:{scale}" / "decimal:256:{precision}:{scale}"
+  // * "time:{unit}" / "timestamp:{unit}" / "duration:{unit}", where unit is
+  // "s", "ms", "us", "ns"
+  // * "dict:{value_type}:{index_type}:false"
+  string logical_type = 5;
+  // If this field is nullable.
+  bool nullable = 6;
+
+  // optional field metadata (e.g. extension type name/parameters)
+  map<string, bytes> metadata = 10;  
+
+  bool unenforced_primary_key = 12;
+
+  // Position of this field in the primary key (1-based).
+  // 0 means the field is part of the primary key but uses schema field id for ordering.
+  // When set to a positive value, primary key fields are ordered by this position.
+  uint32 unenforced_primary_key_position = 13;
+
+  // DEPRECATED ----------------------------------------------------------------
+
+  // Deprecated: Only used in V1 file format. V2 uses variable encodings defined
+  // per page.
+  //
+  // The global encoding to use for this field.
+  Encoding encoding = 7;
+
+  // Deprecated: Only used in V1 file format. V2 dynamically chooses when to
+  // do dictionary encoding and keeps the dictionary in the data files.
+  //
+  // The file offset for storing the dictionary value.
+  // It is only valid if encoding is DICTIONARY.
+  //
+  // The logic type presents the value type of the column, i.e., string value.
+  Dictionary dictionary = 8;
+
+  // Deprecated: optional extension type name, use metadata field
+  // ARROW:extension:name
+  string extension_name = 9;
+
+  // Field number 11 was previously `string storage_class`.
+  // Keep it reserved so older manifests remain compatible while new writers
+  // avoid reusing the slot.
+  reserved 11;
+  reserved "storage_class";
+
+}
+```
+
+### transaction
+
+Lance 采用 **MVCC（多版本并发控制）** 提供 ACID 事务保证。每次提交都会通过原子存储操作创建一个**新的、不可变的表版本**，所有版本构成可序列化的历史，支持**时间旅行（time travel）**和**模式演进（schema evolution）**。
+
+事务是 Lance 中变更的基本单位，支持**乐观并发控制**和**自动冲突解决**。
+
+#### 提交协议
+
+**存储原语**
+
+Lance 依赖底层对象存储的两个原子操作：
+
+- **rename-if-not-exists**：仅在目标不存在时原子重命名文件
+- **put-if-not-exists**（条件 PUT）：仅在文件不存在时原子写入
+
+这两个原语保证多个写入者并发创建同一个 manifest 文件时，**有且仅有一个成功**。
+
+**Manifest 命名方案**
+
+- **V1**：`{version}.manifest`（单调递增版本号，如 `1.manifest`）
+- **V2**：`{u64::MAX - version:020}.manifest`（反向字典序，便于快速发现最新版本）
+
+**事务文件（Transaction Files）**
+
+存储每次提交尝试的序列化事务 protobuf 消息，用于：
+
+1. 提交重试时重建 manifest（当并发事务已提交时）
+2. 通过描述执行的操作来支持冲突检测
+
+**提交算法**
+
+尝试使用存储原语原子写入新的 manifest 文件。当并发写入者冲突时，系统加载事务文件检测冲突，并尝试**重基（rebase）**事务。如果原子提交失败，则使用更新后的事务状态重试。
+
+#### 事务类型
+
+每个事务包含 `read_version`（基于哪个版本构建）、`uuid`（唯一标识）和 `operation`（操作类型）。
+
+主要事务类型：
+
+| 类型                  | 说明                                                         | 关键特性                                               |
+| --------------------- | ------------------------------------------------------------ | ------------------------------------------------------ |
+| **Append**            | 追加新数据片段（fragment），不修改现有数据                   | 与大多数操作兼容，支持并发追加                         |
+| **Delete**            | 使用删除向量（deletion vectors）标记行删除                   | 可更新片段或删除整个片段；支持重基合并删除向量         |
+| **Overwrite**         | 完全覆盖表（新数据、新模式、新配置）                         | 几乎与所有其他操作冲突，但配置冲突可重试               |
+| **CreateIndex**       | 添加/替换/删除二级索引（向量、标量、全文索引）               | 新片段可暂时无索引；更新/删除与建索引兼容              |
+| **Rewrite**           | 重组数据（压缩、去碎片化、重排序），不改变语义               | 改变行地址，需预留 fragment ID；与索引操作有条件兼容   |
+| **Merge**             | 添加新列，修改模式                                           | **过于通用的操作**，冲突概率高，建议优先用更具体的操作 |
+| **Project**           | 删除列（仅元数据操作，不修改数据文件）                       | 与大多数操作兼容                                       |
+| **Restore**           | 回滚到历史版本                                               | 优先级最高，与几乎所有操作冲突                         |
+| **ReserveFragments**  | 预分配 fragment ID，供后续 Rewrite 使用                      | 仅与修改 max fragment id 的操作冲突                    |
+| **Clone**             | 浅拷贝（仅元数据）或深拷贝（完整复制）                       | 只能是数据集的第一个操作                               |
+| **Update**            | 修改行值（不增删行），支持 REWRITE\_ROWS 和 REWRITE\_COLUMNS 两种模式 | 兼具删除和追加特性；可重基合并删除掩码                 |
+| **UpdateConfig**      | 修改表配置、元数据                                           | 仅与修改相同配置键的操作冲突                           |
+| **DataReplacement**   | 替换特定列区域的数据                                         | 比 Merge/Update 更安全简单                             |
+| **UpdateMemWalState** | 更新 MemWal 索引状态                                         | -                                                      |
+| **UpdateBases**       | 添加新的 base path，引用其他位置的数据文件                   | 仅与相同 id/name/path 的 UpdateBases 冲突              |
+
+#### 冲突解决
+
+三种冲突结果：
+
+1. **可重基（Rebasable）**：事务可被自动修改以融入并发变更，然后在提交层自动重试
+2. **可重试（Retryable）**：无法自动重基，但可在应用层重新执行（需重新读取数据并重试）
+3. **不兼容（Incompatible）**：根本冲突，重试会产生语义不同的结果，返回不可重试错误
+
+##### 重基机制（Rebase Mechanism）
+
+`TransactionRebase` 结构跟踪：
+
+- 片段映射（标记哪些需要重写）
+- 修改检测（跟踪被修改或删除的 fragment ID）
+- 受影响行（Delete/Update 操作中的具体行，用于细粒度冲突检测）
+- Fragment 重用索引（累积并发 Rewrite 的元数据）
+
+重基过程会比较片段修改、检测行重叠、合并删除向量、更新索引引用等。
+
+##### 冲突场景示例
+
+**可重基冲突示例**：
+
+- Writer A 删除片段中的行 100-199，提交成功
+- Writer B 删除同一片段中的行 500-599
+- 两者修改的行不重叠，Writer B 可自动重基：合并删除向量后成功提交
+
+**可重试冲突示例**：
+
+- Writer A 压缩片段 1-5
+- Writer B 更新片段 3 中的行
+- 片段 3 已不存在（被压缩），无法自动重基，需应用层重新执行更新
+
+**不兼容冲突示例**：
+
+- Writer A 将表恢复到版本 1
+- Writer B 尝试删除版本 2-3 中添加的行
+- 表已恢复到 v1，目标行已不存在，重试会产生不同语义，返回不兼容错误
+
+### Layout（存储物理布局）
+
+Lance 的存储布局设计强调**可移植性**，允许数据集在不同对象存储系统之间迁移或引用，且只需修改最少的元数据。
+
+#### 数据集根目录（Dataset Root）
+
+每个 Lance 数据集有且仅有一个**数据集根目录**，这是数据集创建时的初始位置，也是文件的主要存储位置。根目录包含标准的子目录结构：
+
+- `data/` — 数据文件
+- `_versions/` — Manifest 文件（版本管理）
+- `_deletions/` — 删除向量文件
+- `_indices/` — 索引文件
+- `_refs/` — 标签和分支元数据
+- `tree/` — 分支数据集
+
+> [!IMPORTANT]
+>
+> 一个数据集对应就是一个表，LanceDB操作表实际上就是操作一个数据集，其 `dataset_root` 就是该表的存储位置
+
+标准的数据集目录结构如下：
+
+```plain
+{dataset_root}/
+    data/
+        *.lance              -- 列数据文件
+    _versions/
+        *.manifest           -- 每个版本一个 Manifest 文件
+    _transactions/
+        *.txn                -- 事务文件（用于提交协调）
+    _deletions/
+        *.arrow              -- 删除向量（Arrow IPC 格式，稀疏删除）
+        *.bin                -- 删除向量（Roaring Bitmap 格式，密集删除）
+    _indices/
+        {UUID}/              -- 按索引 UUID 分目录存储
+            ...              -- 不同类型的索引内容各异
+    _refs/
+        tags/
+            *.json           -- 标签元数据
+        branches/
+            *.json           -- 分支元数据
+    tree/
+        {branch_name}/       -- 分支数据集
+            ...
+```
+
+对应每个文件的命名约定如下：
+
+数据文件（Data Files）
+
+- 路径：`data/{uuid-based-filename}.lance`
+- 命名规则：基于 16 字节 UUID 生成 50 字符文件名
+  - 前 3 字节 → 24 字符二进制字符串（最大化字符熵）
+  - 后 13 字节 → 26 字符十六进制字符串
+- 目的：高熵前缀让 S3 内部分区快速识别访问模式并自动扩展，**减少限流（throttling）**
+
+删除文件（Deletion Files）
+
+- 路径：`_deletions/{fragment_id}-{read_version}-{id}.{extension}`
+- 格式：`.arrow`（Arrow IPC，稀疏删除）或 `.bin`（Roaring Bitmap，密集删除）
+
+事务文件（Transaction Files）
+
+- 路径：`_transactions/{read_version}-{uuid}.txn`
+- `read_version` 表示事务基于的表版本
+
+Manifest 文件
+
+- 路径：`_versions/` 目录下
+- 支持 V1（`{version}.manifest`）和 V2（反向字典序）两种命名方案，详见事务文档
+
+#### Base Path 系统（核心设计）
+
+这是 Lance 实现**跨存储引用**和**浅拷贝**的关键机制。
+
+**BasePath 消息结构**
+
+Manifest 中的 `base_paths` 字段包含一组 `BasePath` 条目，定义文件的替代存储位置：
+
+| 字段              | 说明                                                         |
+| ----------------- | ------------------------------------------------------------ |
+| `id`              | 唯一数字标识符，文件元数据通过 `base_id` 引用                |
+| `name`            | 可选的人类可读别名（如标签名）                               |
+| `is_dataset_root` | 为 `true` 时指向标准子目录结构；为 `false` 时直接指向文件目录 |
+| `path`            | 对象存储可解析的绝对路径                                     |
+
+**文件路径解析规则**
+
+读取时的两步解析：
+
+1. **确定基础路径**：无 `base_id` 时使用数据集根目录；有 `base_id` 时查 `base_paths` 数组
+2. **构建完整路径**：
+   - `is_dataset_root=true`：文件位于标准子目录下（`data/`、`_deletions/`、`_indices/`）
+   - `is_dataset_root=false`：基础路径直接指向文件目录，追加文件名即可
+
+#### 复杂布局场景示例
+
+**热/冷分层存储（Hot/Cold Tiering）**
+
+```plain
+base_paths:
+  { id: 0, path: "s3://hot-bucket/dataset", is_dataset_root: true }
+  { id: 1, path: "s3://cold-bucket/dataset-archive", is_dataset_root: true }
+
+Fragment 0 (近期数据): base_id: 0
+  → s3://hot-bucket/dataset/data/fragment-0.lance
+
+Fragment 100 (历史数据): base_id: 1
+  → s3://cold-bucket/dataset-archive/data/fragment-100.lance
+```
+
+无需数据移动即可跨存储层级无缝查询。
+
+**多区域分发（Multi-Region Distribution）**
+
+```plain
+base_paths:
+  { id: 0, path: "s3://us-east-bucket/dataset" }
+  { id: 1, path: "s3://eu-west-bucket/dataset" }
+  { id: 2, path: "s3://ap-south-bucket/dataset" }
+```
+
+按数据本地性分发片段，计算任务可从最近区域读取。
+
+#### 数据集可移植性
+
+Base Path 系统 + 相对路径引用提供了强大的可移植性保证：
+
+- **完整迁移**：复制数据集根目录的全部内容到新位置即可直接使用，无需修改 manifest（内部文件引用都是相对路径）
+- **部分迁移**：仅复制数据集根目录可保留对其他 base path 的引用；也可复制额外的 base path 到新位置并更新 manifest 中的 `base_paths` 字段
+- **轻量级修改**：仅需修改 manifest 中的 `base_paths`，无需重写数据文件或其他元数据
+
+### Index
+
+Lance 支持三大类索引：
+
+| 类别                   | 用途                   | 示例                                 | 查询模式                               |
+| ---------------------- | ---------------------- | ------------------------------------ | -------------------------------------- |
+| **标量索引（Scalar）** | 加速标量数据查询       | B-tree、全文搜索索引                 | 接收查询谓词（等值、范围），输出行地址 |
+| **向量索引（Vector）** | 高维向量近似最近邻搜索 | IVF、HNSW                            | 接收查询向量，返回最近邻行地址及距离   |
+| **系统索引（System）** | 加速内部系统操作       | Fragment Reuse Index（片段重用索引） | 不直接用于用户查询                     |
+
+Lance索引设计原则：
+
+1. **按需加载**：数据集可完全不加载索引就打开和读取，仅在查询需要时才加载索引，最小化内存占用和打开时间
+2. **渐进式加载**：查询时只加载必要部分。例如 B-tree 先加载页表确定需加载哪些页，再仅加载这些页，摊平冷索引查询成本
+3. **索引段可合并覆盖多个片段**：索引文件远小于数据文件，将索引段合并覆盖多个片段可减少查询时需打开的文件数和需查询的索引结构数
+4. **索引文件不可变**：一旦写入即不可修改，只能通过创建新文件变更，可安全缓存在内存或磁盘而无需担心一致性问题
+
+#### 基本概念
+
+**索引结构**
+
+- **索引（Index）**：定义在数据集的特定列（或多列）上，通过**名称**标识
+- **索引段（Index Segment）**：索引由多个独立的索引段组成，每个段有唯一 UUID，是自包含的索引，覆盖数据的一个子集
+- **片段覆盖（fragment_bitmap）**：每个索引段覆盖一组不重叠的片段。索引段**无需覆盖所有片段**——未覆盖的片段可通过直接扫描处理
+
+**示例**
+
+一个包含 3 个片段（id 0,1,2）的数据集，片段 1 有 10 行被删除：
+
+- **id_idx** 索引有两个段：一个覆盖片段 0，一个覆盖片段 1。片段 2 未被覆盖，查询时需直接扫描片段 2，且片段 1 的结果需过滤删除行
+- **vec_idx** 索引有一个段覆盖所有 3 个片段，查询时无需直接扫描任何片段，但仍需过滤片段 1 的删除行
+
+#### 索引存储
+
+- **存储位置**：`_indices/{UUID}/` 目录下（称为**索引目录**）
+- **内容格式**：取决于索引类型，通常由 Lance 文件组成，复用现有的 Lance 文件格式读写代码
+- **base_id 支持**：可通过 `base_id` 引用其他 base path（支持跨存储引用，与数据文件机制相同）
+
+#### 创建和更新索引段
+
+通过事务机制原子完成：
+
+1. **构建索引数据**：读取待索引片段的列数据，构建索引结构，写入新的 `_indices/{UUID}` 目录
+2. **准备元数据**：创建 `IndexMetadata` 消息，包含：
+   - `uuid`：新生成的 UUID
+   - `name`：索引名称（添加到现有索引时必须匹配）
+   - `fields`：被索引的列
+   - `fragment_bitmap`：该段覆盖的片段 ID 集合
+   - `index_details`：索引特定的配置和参数
+   - `version`：索引类型格式版本
+3. **提交事务**：通过事务机制原子写入包含新索引段的 manifest
+
+**原地更新索引列时**：引擎必须从覆盖该片段的索引段的 `fragment_bitmap` 中移除该片段 ID，标记为需要重新索引，防止读取无效数据。
+
+#### 索引兼容性
+
+使用索引段前引擎必须验证：
+
+1. **索引类型**：`index_details` 中的 protobuf `Any` 消息的 type URL 标识索引类型（如 B-tree、IVF、HNSW）。引擎不认识则跳过该段
+2. **版本**：`version` 字段表示索引段格式版本。不支持则跳过
+
+不兼容时回退到直接扫描该段本应覆盖的片段。
+
+#### 加载索引
+
+1. 从 manifest 的 `index_section` 字段获取索引段偏移量
+2. 从 manifest 文件读取 `IndexSection`（包含 `IndexMetadata` 列表）
+3. 从 `_indices/{UUID}` 目录读取索引文件
+
+**优化**：manifest 文件较小时可积极缓存索引段，避免额外文件读取。
+
+**IndexMetadata 关键字段**
+
+| 字段              | 说明                                        |
+| ----------------- | ------------------------------------------- |
+| `uuid`            | 索引段唯一标识                              |
+| `fields`          | 索引列（引用 file.Field.id）                |
+| `name`            | 索引名称（数据集版本内唯一）                |
+| `dataset_version` | 构建索引时的数据集版本                      |
+| `fragment_bitmap` | 覆盖的片段 ID 位图（32-bit Roaring bitmap） |
+| `index_details`   | 索引类型特定的详情（protobuf Any）          |
+| `index_version`   | 兼容的最低 Lance 版本                       |
+| `created_at`      | 创建时间戳（毫秒级 UTC）                    |
+| `base_id`         | 数据文件的 base path 索引                   |
+| `files`           | 索引文件列表及大小（避免 HEAD 调用）        |
+
+#### 处理删除和失效行
+
+由于索引段不可变，可能包含对已删除或已更新行的引用，查询时需过滤：
+
+1. **部分删除**：片段中部分行被删除。使用删除文件的行地址过滤索引结果
+2. **完全删除**：片段在 `fragment_bitmap` 中存在但在数据集中已缺失。过滤该片段的所有行地址
+3. **原地更新**：索引列被更新。通过检查索引当前 `fragment_bitmap` 中是否包含该行地址来过滤（更新时会从 bitmap 中移除片段 ID）
+
+#### 压缩与行地址重映射（Compaction & Remapping）
+
+片段压缩后行地址改变，引用这些片段的索引段将失效。三种处理方式：
+
+| 方式             | 做法                                                     | 优点         | 缺点                               |
+| ---------------- | -------------------------------------------------------- | ------------ | ---------------------------------- |
+| **什么都不做**   | 让索引段不再覆盖这些片段                                 | 简单         | 压缩后立即使索引过时，查询性能最差 |
+| **立即重写**     | 用新行地址重写索引段                                     | 索引保持最新 | 压缩时产生大量写放大               |
+| **片段重用索引** | 创建映射表将旧行地址映射到新行地址，查询时在内存中重映射 | 避免写放大   | 查询时增加 IO 和计算开销           |
+
+#### 稳定行 ID（Stable Row ID）
+
+索引可选择使用**稳定行 ID** 替代行地址：
+
+- **稳定行 ID**：逻辑标识符，压缩后行移动时保持不变
+- **优点**：压缩后无需重映射；更新仅在索引列数据变化时使索引失效
+- **缺点**：查询时需额外查找将稳定行 ID 翻译为物理行地址
+- **状态**：目前为实验性功能，性能评估进行中
+
 
 
 ## Lance Catalog Spec
